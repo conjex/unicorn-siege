@@ -1,0 +1,102 @@
+name: publish-web
+
+# Builds the single-file iPhone web version of Unicorn Siege from a release APK
+# and publishes it to GitHub Pages (docs/).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag holding the APK
+        default: v4.0.3
+  push:
+    paths:
+      - .github/workflows/publish-web.yml
+
+permissions:
+  contents: write
+
+concurrency: publish-web
+
+env:
+  REL_TAG: v4.0.3
+  APK_ASSET: 1-unicorn-siege.apk
+  WEB_FILE: 5-index.html
+  WEB_VER: "4.0.3"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Fetch APK and unpack its assets
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/app.apk "https://github.com/${{ github.repository }}/releases/download/${REL_TAG}/${APK_ASSET}"
+          rm -rf /tmp/apk && mkdir -p /tmp/apk
+          cd /tmp/apk && unzip -q /tmp/app.apk 'assets/*'
+          ls /tmp/apk/assets | head
+
+      - name: Pack single-file web build
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, json, base64
+          SRC = '/tmp/apk/assets'
+          OUT = 'docs/5-index.html'
+          VER = '4.0.3'
+          html = open(os.path.join(SRC, 'index.html'), encoding='utf-8').read()
+          data = {}
+          for n in sorted(os.listdir(os.path.join(SRC, 'img'))):
+              b = open(os.path.join(SRC, 'img', n), 'rb').read()
+              data[n] = 'data:image/webp;base64,' + base64.b64encode(b).decode('ascii')
+          def patch_js(js, name):
+              js = js.replace('"img/" + n + ".webp"', 'IMGURL(n)')
+              js = js.replace('"img/ui_thumbs.webp"', 'IMGURL("ui_thumbs")')
+              js = js.replace('"url(img/env_" + L.env + "_sky.webp)"',
+                              '"url(" + IMGURL("env_" + L.env + "_sky") + ")"')
+              assert '</script' not in js.lower(), name
+              return js
+          scripts = re.findall(r'<script src="([^"]+)"></script>', html)
+          assert len(scripts) == 10, scripts
+          for name in scripts:
+              js = patch_js(open(os.path.join(SRC, name), encoding='utf-8').read(), name)
+              html = html.replace('<script src="%s"></script>' % name,
+                                  '<script>/* %s */\n%s\n</script>' % (name, js), 1)
+          assert '<script src=' not in html
+          html = html.replace('src="img/ui_title.webp"', 'src="%s"' % data['ui_title.webp'])
+          html = re.sub(r'url\(img/([A-Za-z0-9_]+\.webp)\)', lambda m: 'url(%s)' % data[m.group(1)], html)
+          left = re.findall(r'img/[A-Za-z0-9_]+\.webp', html)
+          assert not left, left
+          parts = ','.join('%s:%s' % (json.dumps(k), json.dumps(v)) for k, v in data.items())
+          pre = ('<script>/* Unicorn Siege %s web build: inlined art */\n'
+                 'window.IMG_DATA={%s};\n'
+                 'function IMGURL(n){var d=window.IMG_DATA&&IMG_DATA[n+".webp"];return d||("img/"+n+".webp");}\n'
+                 '</script>\n') % (VER, parts)
+          i = html.find('<script>')
+          assert i > 0
+          html = html[:i] + pre + html[i:]
+          open(OUT, 'w', encoding='utf-8').write(html)
+          print('wrote', OUT, os.path.getsize(OUT), 'images', len(data), 'version', VER)
+          PY
+          ls -l docs/
+
+      - name: Point the site at the new build
+        run: |
+          set -euo pipefail
+          cat > docs/index.html <<'HTML'
+          <!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='0;url=5-index.html?v=403'><a href='5-index.html?v=403'>Play Unicorn Siege</a>
+          HTML
+          cat docs/index.html
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name 'unicorn-web-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add docs
+          if git diff --cached --quiet; then echo 'nothing to commit'; exit 0; fi
+          git commit -m "web: publish ${WEB_VER} to docs"
+          git push origin HEAD:main
